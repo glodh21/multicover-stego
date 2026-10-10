@@ -1,15 +1,31 @@
+import math
+
 from image_percent import ImageCapacityCalculator
 
 
-def split_text_by_percentage(text: str, capacity_results: list[dict]) -> list[dict]:
-    """Split `text` into one chunk per image, sized by each image's
-    capacity_percentage.
+def header_field_sizes(capacities: list[dict]) -> tuple[int, int]:
+    """Smallest bit widths that can hold the header fields.
 
-    Uses cumulative boundaries (round(cumulative_pct * len(text))) so rounding
-    errors never accumulate and the chunks always add up to the full text,
-    in order, with nothing lost or duplicated.
+    seq : enough bits for the highest sequence number (0 .. n-1).
+    len : enough bits for the largest chunk length in BYTES any image could
+          hold (max_capacity_bits // 8).
+    """
+    n_images = len(capacities)
+    seq_bits = max(1, (n_images - 1).bit_length())
 
-    Returns one dict per image: the image's info plus the chunk and its sizes.
+    max_len_bytes = max(c["max_capacity_bits"] for c in capacities) // 8
+    len_bits = max(1, max_len_bytes.bit_length())
+    return seq_bits, len_bits
+
+
+def split_text_by_percentage(text: str, capacity_results: list[dict],
+                             seq_bits: int, len_bits: int) -> list[dict]:
+    """Split `text` into one chunk per image, sized by capacity_percentage.
+
+    Images must already be sorted so the highest-capacity one is LAST: it
+    receives whatever is left over after rounding.
+
+    Each payload = [seq no][chunk length in bytes][chunk bytes], as bits.
     """
     n_chars = len(text)
     chunks = []
@@ -18,61 +34,35 @@ def split_text_by_percentage(text: str, capacity_results: list[dict]) -> list[di
 
     for i, res in enumerate(capacity_results):
         cumulative_pct += res["capacity_percentage"]
-        # Last image always ends exactly at the end of the text.
         end = n_chars if i == len(capacity_results) - 1 \
             else round(cumulative_pct / 100.0 * n_chars)
 
         chunk = text[start:end]
-        chunk_bits = len(chunk.encode("utf-8")) * 8  # bits needed to embed it
+        chunk_bytes = chunk.encode("utf-8")
+        chunk_len = len(chunk_bytes)
+
+        header_bits = f"{i:0{seq_bits}b}" + f"{chunk_len:0{len_bits}b}"
+        data_bits = "".join(f"{b:08b}" for b in chunk_bytes)
+        payload_bits = header_bits + data_bits
 
         chunks.append({
             "path": res["path"],
-            "capacity_percentage": res["capacity_percentage"],
-            "capacity_bits": res["max_capacity_bits"],
+            "max_capacity_bits": res["max_capacity_bits"],
+            "seq": i,
             "chunk": chunk,
-            "chunk_chars": len(chunk),
-            "chunk_bits": chunk_bits,
-            "fits": chunk_bits <= res["max_capacity_bits"],
-            "start": start,
-            "end": end,
+            "chunk_len_bytes": chunk_len,
+            "header_bits": header_bits,
+            "payload_bits": payload_bits,          # use this for embedding
+            "payload_len_bits": len(payload_bits),
+            "fits": (len(payload_bits) <= res["max_capacity_bits"]
+                     and chunk_len < 2 ** len_bits),
         })
         start = end
 
     return chunks
 
 
-def print_capacity_table(results: list[dict]) -> None:
-    print()
-    print(f"{'Image Path':<30} | {'Dims':<12} | {'Pixels':<10} | "
-          f"{'Entropy':<9} | {'Raw Cap (bits)':<15} | "
-          f"{'Floored Cap (bits)':<19} | {'% of Total':<10}")
-    print("-" * 120)
-    for r in results:
-        dims = f"{r['dimensions'][0]}x{r['dimensions'][1]}"
-        print(f"{r['path']:<30} | {dims:<12} | {r['num_pixels']:<10,d} | "
-              f"{r['hbar']:<9.4f} | {r['raw_capacity_bits']:<15,d} | "
-              f"{r['max_capacity_bits']:<19,d} | "
-              f"{r['capacity_percentage']:<10.2f}")
-
-
-def print_chunks(chunks: list[dict]) -> None:
-    print("\n" + "=" * 120)
-    print("TEXT CHUNKS PER IMAGE")
-    print("=" * 120)
-    for i, c in enumerate(chunks, start=1):
-        status = "OK" if c["fits"] else "EXCEEDS CAPACITY"
-        print(f"\n[Part {i}] {c['path']}")
-        print(f"  Capacity share : {c['capacity_percentage']:.2f}% "
-              f"({c['capacity_bits']:,} bits)")
-        print(f"  Chunk size     : {c['chunk_chars']:,} chars "
-              f"= {c['chunk_bits']:,} bits  [{status}]")
-        print(f"  Text range     : [{c['start']}:{c['end']}]")
-        print(f"  Chunk text     :\n{c['chunk']}")
-        print("-" * 120)
-
-
 def main():
-    # Put your image paths here
     my_images = [
         "images/high_bike.png",
         "images/low-sky.png",
@@ -81,32 +71,31 @@ def main():
         "images/high_kayak.png",
     ]
 
-    # The text you want to hide (replace with your own, or read from a file)
     secret_text = (
-        "The Mahabharata is one of the greatest Indian epics, traditionally attributed to the sage Ved Vyasa. It tells the story of the conflict between the Pandavas and the Kauravas, who were cousins fighting for the throne of Hastinapura. The epic describes the struggle between good and evil, the importance of truth, duty, justice, and righteousness. The Kurukshetra War forms the central part of the story, during which Lord Krishna guides Arjuna and explains the teachings of the Bhagavad Gita. The Mahabharata also contains stories of bravery, loyalty, sacrifice, love, and betrayal. It teaches us that greed, jealousy, and pride can lead to destruction, while following dharma (righteousness) is essential for leading a meaningful life."
+        "The Mahabharata is one of the greatest Indian epics, traditionally attributed to the sage Ved Vyasa."
     )
     # secret_text = open("secret.txt", encoding="utf-8").read()
 
-    # 1) Compute capacities (all values come back as a list of dicts)
+    # 1) Compute capacities
     calculator = ImageCapacityCalculator(floor_fraction=0.03)
     capacities = calculator.calculate_image_capacities(my_images)
-    print_capacity_table(capacities)
 
-    # 2) Split the text according to each image's percentage
-    chunks = split_text_by_percentage(secret_text, capacities)
-    print_chunks(chunks)
+    # 2) Sort ascending by capacity -> highest-capacity image is LAST
+    capacities.sort(key=lambda c: c["max_capacity_bits"])
 
-    # 3) Sanity checks
-    total_text_bits = len(secret_text.encode("utf-8")) * 8
-    total_capacity_bits = sum(c["max_capacity_bits"] for c in capacities)
-    print(f"\nTotal text      : {len(secret_text):,} chars ({total_text_bits:,} bits)")
-    print(f"Total capacity  : {total_capacity_bits:,} bits")
-    if total_text_bits > total_capacity_bits:
-        print("WARNING: text is larger than the total capacity of all images.")
-    if "".join(c["chunk"] for c in chunks) != secret_text:
-        print("WARNING: chunks do not reassemble into the original text.")
+    # 3) Header field widths, then split text
+    seq_bits, len_bits = header_field_sizes(capacities)
+    chunks = split_text_by_percentage(secret_text, capacities, seq_bits, len_bits)
 
-    # `capacities` and `chunks` are ready for the embedding step later.
+    # 4) Output: image name, max capacity, (seq no + len + chunk) together
+    for c in chunks:
+        print(f"{c['path']} | max capacity: {c['max_capacity_bits']:,} bits")
+        print(f"  [{c['header_bits']}] {c['chunk']}")
+        if not c["fits"]:
+            print("  WARNING: payload exceeds this image's capacity")
+        print()
+
+    # `chunks` holds everything needed for embedding (payload_bits per image).
     return capacities, chunks
 
 
