@@ -2,7 +2,7 @@
 with an added capacity floor.
 
 Usage:
-    from image_capacity import ImageCapacityCalculator
+    from image_percent import ImageCapacityCalculator
 
     calc = ImageCapacityCalculator(floor_fraction=0.03)
     results = calc.calculate_image_capacities(["a.png", "b.png"])
@@ -76,6 +76,10 @@ class ImageCapacityCalculator:
         """For each image compute hbar, then capacity via Eq. (20):
             c_i = r_i * s_i * (hbar_i - hbar_min) / (hbar_max - hbar_min)
         with the floor applied, plus each image's percentage of total capacity.
+
+        Returns a list of dicts, one per image, with keys:
+            path, dimensions, num_pixels, hbar,
+            raw_capacity_bits, max_capacity_bits, capacity_percentage
         """
         results = []
         for path in image_paths:
@@ -121,17 +125,17 @@ class ImageCapacityCalculator:
         return results
 
     # ------------------------------------------------------------------
-    # Convenience: pretty-print results
+    # Convenience: pretty-print results (disabled; main.py prints instead)
     # ------------------------------------------------------------------
-    @staticmethod
-    def print_results(results: list[dict]) -> None:
-        print()
-        print(f"{'Image Path':<35} | {'Entropy (hbar)':<14} | "
-              f"{'Raw Cap (bits)':<16} | {'Floored Cap (bits)':<20} | "
-              f"{'% of Total Cap':<14}")
-        print("-" * 115)
-        for img in results:
-            print(f"{img['path']:<35} | {img['hbar']:<14.4f} | "
-                  f"{img['raw_capacity_bits']:<16,d} | "
-                  f"{img['max_capacity_bits']:<20,d} | "
-                  f"{img['capacity_percentage']:<14.2f}")
+    # @staticmethod
+    # def print_results(results: list[dict]) -> None:
+    #     print()
+    #     print(f"{'Image Path':<35} | {'Entropy (hbar)':<14} | "
+    #           f"{'Raw Cap (bits)':<16} | {'Floored Cap (bits)':<20} | "
+    #           f"{'% of Total Cap':<14}")
+    #     print("-" * 115)
+    #     for img in results:
+    #         print(f"{img['path']:<35} | {img['hbar']:<14.4f} | "
+    #               f"{img['raw_capacity_bits']:<16,d} | "
+    #               f"{img['max_capacity_bits']:<20,d} | "
+    #               f"{img['capacity_percentage']:<14.2f}")
