@@ -1,6 +1,11 @@
-import math
+import os
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from image_percent import ImageCapacityCalculator
+
+NONCE_BYTES = 12   # standard GCM nonce size
+TAG_BYTES = 16     # GCM auth tag, appended to ciphertext by AESGCM
 
 
 def header_field_sizes(capacities: list[dict]) -> tuple[int, int]:
@@ -18,15 +23,33 @@ def header_field_sizes(capacities: list[dict]) -> tuple[int, int]:
     return seq_bits, len_bits
 
 
-def split_text_by_percentage(text: str, capacity_results: list[dict],
-                             seq_bits: int, len_bits: int) -> list[dict]:
-    """Split `text` into one chunk per image, sized by capacity_percentage.
+def pack_payload(seq: int, chunk_bytes: bytes,
+                 seq_bits: int, len_bits: int) -> tuple[bytes, str]:
+    """Build [seq][len][chunk] as a bit string, zero-pad to a whole number of
+    bytes (AES-GCM works on bytes), and return (plaintext_bytes, header_bits).
+
+    The len field tells the decoder exactly how many chunk bytes to read, so
+    the trailing padding bits are simply ignored after decryption.
+    """
+    header_bits = f"{seq:0{seq_bits}b}" + f"{len(chunk_bytes):0{len_bits}b}"
+    data_bits = "".join(f"{b:08b}" for b in chunk_bytes)
+    bits = header_bits + data_bits
+    bits += "0" * ((-len(bits)) % 8)
+    return int(bits, 2).to_bytes(len(bits) // 8, "big"), header_bits
+
+
+def split_and_encrypt(text: str, capacity_results: list[dict],
+                      seq_bits: int, len_bits: int, key: bytes) -> list[dict]:
+    """Split `text` by capacity percentage, then encrypt each
+    (seq + len + chunk) payload with AES-256-GCM using the same key.
 
     Images must already be sorted so the highest-capacity one is LAST: it
     receives whatever is left over after rounding.
 
-    Each payload = [seq no][chunk length in bytes][chunk bytes], as bits.
+    Encrypted blob layout (what you embed, and later decrypt):
+        nonce (12 bytes) || ciphertext || GCM tag (16 bytes)
     """
+    aesgcm = AESGCM(key)
     n_chars = len(text)
     chunks = []
     cumulative_pct = 0.0
@@ -39,27 +62,36 @@ def split_text_by_percentage(text: str, capacity_results: list[dict],
 
         chunk = text[start:end]
         chunk_bytes = chunk.encode("utf-8")
-        chunk_len = len(chunk_bytes)
 
-        header_bits = f"{i:0{seq_bits}b}" + f"{chunk_len:0{len_bits}b}"
-        data_bits = "".join(f"{b:08b}" for b in chunk_bytes)
-        payload_bits = header_bits + data_bits
+        plaintext, header_bits = pack_payload(i, chunk_bytes, seq_bits, len_bits)
 
+        # Same key for every chunk, so the nonce MUST be unique per chunk.
+        nonce = os.urandom(NONCE_BYTES)
+        blob = nonce + aesgcm.encrypt(nonce, plaintext, None)
+
+        blob_bits = len(blob) * 8
         chunks.append({
             "path": res["path"],
             "max_capacity_bits": res["max_capacity_bits"],
             "seq": i,
             "chunk": chunk,
-            "chunk_len_bytes": chunk_len,
+            "chunk_len_bytes": len(chunk_bytes),
             "header_bits": header_bits,
-            "payload_bits": payload_bits,          # use this for embedding
-            "payload_len_bits": len(payload_bits),
-            "fits": (len(payload_bits) <= res["max_capacity_bits"]
-                     and chunk_len < 2 ** len_bits),
+            "encrypted_blob": blob,                 # bytes: use for embedding
+            "encrypted_hex": blob.hex(),            # same data, as text
+            "encrypted_len_bits": blob_bits,
+            "fits": (blob_bits <= res["max_capacity_bits"]
+                     and len(chunk_bytes) < 2 ** len_bits),
         })
         start = end
 
     return chunks
+
+
+def save_key(key: bytes, path: str = "data.txt") -> None:
+    """Store the AES-256 key (hex) for later decryption."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"KEY={key.hex()}\n")
 
 
 def main():
@@ -83,19 +115,25 @@ def main():
     # 2) Sort ascending by capacity -> highest-capacity image is LAST
     capacities.sort(key=lambda c: c["max_capacity_bits"])
 
-    # 3) Header field widths, then split text
-    seq_bits, len_bits = header_field_sizes(capacities)
-    chunks = split_text_by_percentage(secret_text, capacities, seq_bits, len_bits)
+    # 3) One random AES-256 key for all chunks, saved to data.txt
+    key = AESGCM.generate_key(bit_length=256)
+    save_key(key, "data.txt")
 
-    # 4) Output: image name, max capacity, (seq no + len + chunk) together
+    # 4) Header widths, split, encrypt
+    seq_bits, len_bits = header_field_sizes(capacities)
+    chunks = split_and_encrypt(secret_text, capacities, seq_bits, len_bits, key)
+
+    # 5) Output
+    print(f"seq_bits={seq_bits}, len_bits={len_bits}  (needed again at decode time)\n")
     for c in chunks:
         print(f"{c['path']} | max capacity: {c['max_capacity_bits']:,} bits")
-        print(f"  [{c['header_bits']}] {c['chunk']}")
+        print(f"  plain     : [{c['header_bits']}] {c['chunk']}")
+        print(f"  encrypted : {c['encrypted_hex']}")
+        print(f"  enc. size : {c['encrypted_len_bits']:,} bits")
         if not c["fits"]:
-            print("  WARNING: payload exceeds this image's capacity")
+            print("  WARNING: encrypted payload exceeds this image's capacity")
         print()
 
-    # `chunks` holds everything needed for embedding (payload_bits per image).
     return capacities, chunks
 
 
