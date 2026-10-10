@@ -1,0 +1,19 @@
+# Python virtual environments
+.venv/
+.venv311/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Private keys and encryption secrets
+keys/receiver_private.pem
+.env
+
+# Generated files
+Stego/
+data.txt
+key_envelope.json
+# RSA keys — keep both local
+keys/
