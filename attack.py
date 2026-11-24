@@ -1,13 +1,29 @@
 """Steganalysis / attack module for the HILL + STC stego images.
 
 Run:
-    python stego_attacks.py --stego Stego --cover images --out results --params data.txt --spam
+    python stego_attacks_extended.py --stego Stego --cover images --out results --params data.txt
+
+Optional STC sidecars / calibration:
+    --syndrome-dir stc_syndromes
+    --payload-calibration payload_calibration.csv
+    --permutations 200 --block-sizes 8,16,32,64
+
+The syndrome test requires actual syndrome bit arrays exported by the STC
+implementation. They cannot be reconstructed reliably from cover/stego PNGs.
+Payload-length estimation requires independent calibration runs.
 
 Outputs (in --out):
     attack_results.csv   one row per stego image (all metrics)
     attack_results.json  same, plus summary + notes
     attack_report.txt    human-readable report
     spam686/<name>.npy   (only with --spam) SPAM-686 features for later classifier use
+
+Added evaluations:
+    - Change-map FFT with permutation p-values
+    - HILL selection-channel AUC (existing; reported explicitly)
+    - Block-grid concentration diagnostics at configurable block sizes
+    - Syndrome distribution (only when an STC syndrome .npy sidecar is supplied)
+    - Payload-length estimate (only when an independent calibration CSV is supplied)
 
 Two attacker models:
   BLIND      : uses the stego image only (chi-square, RS, WS, HCF, LSB tests, HILL costs from stego)
@@ -37,6 +53,219 @@ WS_P_FLAG = 0.05
 PEAK_RATIO_FLAG = 1.5   # (observed FFT peak/median) / (random-permutation null) above this -> periodic
 AUC_FLAG = 0.60         # cost-map AUC above this -> selection channel predictable
 SEG_P_FLAG = 0.01       # change-uniformity over raster segments below this -> non-uniform
+
+
+# ---------------- added evaluation settings ----------------
+DEFAULT_PERMUTATIONS = 200
+DEFAULT_BLOCK_SIZES = (8, 16, 32, 64)
+BLOCK_P_FLAG = 0.01
+
+
+def _upper_tail_p(observed, null_values):
+    null_values = np.asarray(null_values, dtype=np.float64)
+    return float((1 + np.count_nonzero(null_values >= observed)) / (len(null_values) + 1))
+
+
+def _robust_peak_score(spectrum, exclude=3):
+    """Robust standardized maximum spectral magnitude, excluding the centered DC region."""
+    a = np.asarray(spectrum, dtype=np.float64).copy()
+    if a.ndim == 2:
+        cy, cx = a.shape[0] // 2, a.shape[1] // 2
+        a[max(0, cy - exclude):cy + exclude + 1,
+          max(0, cx - exclude):cx + exclude + 1] = np.nan
+    else:
+        c = a.size // 2
+        a[max(0, c - exclude):c + exclude + 1] = np.nan
+    vals = a[np.isfinite(a)]
+    if vals.size == 0:
+        return float("nan")
+    med = float(np.median(vals))
+    mad = float(np.median(np.abs(vals - med)))
+    scale = 1.4826 * mad
+    if scale < 1e-12:
+        scale = float(np.std(vals)) + 1e-12
+    return float((np.nanmax(a) - med) / scale)
+
+
+def _fft_scores(change_map):
+    """2D and raster-order FFT peak scores using Hann windows."""
+    cm = np.asarray(change_map, dtype=np.float64)
+    h, w = cm.shape
+    win2 = np.outer(np.hanning(h), np.hanning(w))
+    a = (cm - cm.mean()) * win2
+    f2 = np.abs(np.fft.fftshift(np.fft.fft2(a)))
+    score2 = _robust_peak_score(f2, exclude=3)
+
+    flat = cm.ravel()
+    win1 = np.hanning(flat.size)
+    a1 = (flat - flat.mean()) * win1
+    f1 = np.abs(np.fft.fftshift(np.fft.fft(a1)))
+    score1 = _robust_peak_score(f1, exclude=3)
+    return score2, score1
+
+
+def change_map_fft_analysis(changed, rng, n_perm=DEFAULT_PERMUTATIONS):
+    """Change-map FFT compared with exact-count uniformly randomized maps.
+
+    This is a spatial-pattern diagnostic, not proof of STC-specific leakage.
+    A HILL-cost-conditioned null should be added for stronger attribution.
+    """
+    ch = np.asarray(changed, dtype=bool)
+    n = int(ch.sum())
+    if n == 0:
+        return {"fft2d_peak_score": float("nan"), "fft2d_p": float("nan"),
+                "fft1d_peak_score": float("nan"), "fft1d_p": float("nan"),
+                "fft2d_peak_excess": float("nan"), "fft1d_raster_peak_excess": float("nan")}
+    obs2, obs1 = _fft_scores(ch)
+    flat_n = ch.size
+    null2 = np.empty(n_perm, dtype=np.float64)
+    null1 = np.empty(n_perm, dtype=np.float64)
+    for i in range(n_perm):
+        idx = rng.choice(flat_n, size=n, replace=False)
+        rnd = np.zeros(flat_n, dtype=np.uint8)
+        rnd[idx] = 1
+        r2, r1 = _fft_scores(rnd.reshape(ch.shape))
+        null2[i], null1[i] = r2, r1
+    mean2 = float(np.mean(null2))
+    mean1 = float(np.mean(null1))
+    return {
+        "fft2d_peak_score": float(obs2),
+        "fft2d_null_mean": mean2,
+        "fft2d_null_99th": float(np.quantile(null2, 0.99)),
+        "fft2d_p": _upper_tail_p(obs2, null2),
+        "fft2d_peak_excess": float(obs2 / mean2) if mean2 > 0 else float("nan"),
+        "fft1d_peak_score": float(obs1),
+        "fft1d_null_mean": mean1,
+        "fft1d_null_99th": float(np.quantile(null1, 0.99)),
+        "fft1d_p": _upper_tail_p(obs1, null1),
+        "fft1d_raster_peak_excess": float(obs1 / mean1) if mean1 > 0 else float("nan"),
+        "fft_permutations": int(n_perm),
+    }
+
+
+def block_structure_analysis(changed, rng, block_sizes=DEFAULT_BLOCK_SIZES,
+                             n_perm=DEFAULT_PERMUTATIONS):
+    """Test block-grid concentration at several scales against exact-count uniform maps.
+
+    This is a generic block-structure diagnostic. It is not an STC decoder and
+    does not identify the STC constraint length unless that length is supplied
+    and independently justified.
+    """
+    ch = np.asarray(changed, dtype=bool)
+    h, w = ch.shape
+    n = int(ch.sum())
+    out = {}
+    if n == 0:
+        return out
+    flat_ids_by_size = {}
+    for b in block_sizes:
+        gy = (np.arange(h) // b)
+        gx = (np.arange(w) // b)
+        ncols = int(gx.max()) + 1
+        ids = (gy[:, None] * ncols + gx[None, :]).ravel()
+        observed_counts = np.bincount(ids[ch.ravel()], minlength=(int(ids.max()) + 1))
+        obs_max = float(observed_counts.max())
+        obs_var = float(observed_counts.var())
+        null_max = np.empty(n_perm, dtype=np.float64)
+        null_var = np.empty(n_perm, dtype=np.float64)
+        for i in range(n_perm):
+            idx = rng.choice(ch.size, size=n, replace=False)
+            counts = np.bincount(ids[idx], minlength=observed_counts.size)
+            null_max[i] = counts.max()
+            null_var[i] = counts.var()
+        key = f"block_{b}"
+        out[f"{key}_max_occupancy"] = obs_max
+        out[f"{key}_occupancy_variance"] = obs_var
+        out[f"{key}_max_p"] = _upper_tail_p(obs_max, null_max)
+        out[f"{key}_variance_p"] = _upper_tail_p(obs_var, null_var)
+        out[f"{key}_null_max_99th"] = float(np.quantile(null_max, 0.99))
+    return out
+
+
+def syndrome_distribution_analysis(bits):
+    """Descriptive tests on an actual STC syndrome bit-vector supplied as a sidecar."""
+    b = np.asarray(bits).ravel()
+    if b.size < 2 or not np.all(np.isin(b, [0, 1])):
+        return {"syndrome_available": False, "syndrome_error": "Expected a 1-D array of at least two binary values."}
+    b = b.astype(np.uint8)
+    n = int(b.size)
+    ones = int(b.sum())
+    p1 = ones / n
+    mono_z = (p1 - 0.5) * 2.0 * np.sqrt(n)
+    mono_p = float(2 * stats.norm.sf(abs(mono_z)))
+    runs = int(1 + np.count_nonzero(b[1:] != b[:-1]))
+    n0, n1 = n - ones, ones
+    if n0 and n1 and n > 1:
+        runs_mean = 1 + (2 * n0 * n1) / n
+        runs_var = (2 * n0 * n1 * (2 * n0 * n1 - n)) / (n * n * (n - 1))
+        runs_z = (runs - runs_mean) / np.sqrt(runs_var) if runs_var > 0 else float("nan")
+        runs_p = float(2 * stats.norm.sf(abs(runs_z))) if np.isfinite(runs_z) else float("nan")
+    else:
+        runs_z, runs_p = float("nan"), float("nan")
+    entropy = 0.0
+    for prob in (p1, 1 - p1):
+        if prob > 0:
+            entropy -= prob * np.log2(prob)
+    corr = float(np.corrcoef(b[:-1], b[1:])[0, 1]) if np.std(b[:-1]) > 0 and np.std(b[1:]) > 0 else float("nan")
+    return {
+        "syndrome_available": True,
+        "syndrome_length_bits": n,
+        "syndrome_ones_fraction": float(p1),
+        "syndrome_binary_entropy": float(entropy),
+        "syndrome_monobit_p": mono_p,
+        "syndrome_runs": runs,
+        "syndrome_runs_p": runs_p,
+        "syndrome_lag1_corr": corr,
+    }
+
+
+def find_syndrome_file(stego_path, syndrome_dir):
+    if not syndrome_dir:
+        return None
+    stem = os.path.splitext(os.path.basename(stego_path))[0]
+    candidates = [os.path.join(syndrome_dir, stem + ".npy")]
+    if stem.startswith("stego_"):
+        candidates.append(os.path.join(syndrome_dir, stem[6:] + ".npy"))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def load_payload_calibration(path):
+    """Fit a simple independent calibration: payload_bits = intercept + slope*n_changes."""
+    if not path:
+        return None
+    rows = []
+    with open(path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            try:
+                rows.append((float(row["n_changes"]), float(row["payload_bits"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    if len(rows) < 3 or len({x for x, _ in rows}) < 2:
+        raise ValueError("Payload calibration needs >=3 rows and >=2 distinct n_changes values; columns: n_changes,payload_bits")
+    x = np.asarray([r[0] for r in rows], dtype=np.float64)
+    y = np.asarray([r[1] for r in rows], dtype=np.float64)
+    slope, intercept = np.polyfit(x, y, 1)
+    pred = intercept + slope * x
+    ss_res = float(np.sum((y - pred) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return {"intercept": float(intercept), "slope": float(slope),
+            "r2_training": float(r2), "n_calibration": len(rows)}
+
+
+def estimate_payload_length(n_changes, calibration):
+    if calibration is None:
+        return {"payload_estimation_available": False}
+    estimate = calibration["intercept"] + calibration["slope"] * n_changes
+    return {
+        "payload_estimation_available": True,
+        "payload_estimated_bits": float(max(0.0, estimate)),
+        "payload_calibration_r2_training": calibration["r2_training"],
+        "payload_calibration_samples": calibration["n_calibration"],
+    }
 
 
 def load_gray(path):
@@ -211,7 +440,7 @@ def _auc_low_cost(cost, changed):
     return float((ranks[flat].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
 
 
-def known_cover_attacks(cover, stego, rng):
+def known_cover_attacks(cover, stego, rng, n_perm=DEFAULT_PERMUTATIONS, block_sizes=DEFAULT_BLOCK_SIZES):
     out = {}
     diff = stego.astype(np.int32) - cover.astype(np.int32)
     ch = diff != 0
@@ -238,17 +467,11 @@ def known_cover_attacks(cover, stego, rng):
     out["frac_plus_on_even_cover"] = float(((diff == 1) & even).sum() / max(npl, 1))
     out["frac_minus_on_odd_cover"] = float(((diff == -1) & ~even).sum() / max(nmi, 1))
 
-    # periodicity / block structure of the change map
-    cm = ch.astype(np.float64)
+    # Change-map FFT and block-grid structure diagnostics.
     if n_ch > 0:
-        o2, n2, loc2 = _peak_ratio(cm, rng)
-        o1, n1, loc1 = _peak_ratio(cm.ravel(), rng)
-        out.update({"fft2d_peak_ratio": o2, "fft2d_null_ratio": n2,
-                    "fft2d_peak_excess": o2 / n2, "fft2d_peak_loc": list(map(int, loc2)),
-                    "fft1d_raster_peak_ratio": o1, "fft1d_raster_null_ratio": n1,
-                    "fft1d_raster_peak_excess": o1 / n1, "fft1d_raster_peak_bin": int(loc1[0]),
-                    "fft1d_raster_peak_period_px": float(N / max(loc1[0], 1))})
-        # last-block / tail artifact and density uniformity along raster order
+        out.update(change_map_fft_analysis(ch, rng, n_perm=n_perm))
+        out.update(block_structure_analysis(ch, rng, block_sizes=block_sizes, n_perm=n_perm))
+        # Legacy raster segmentation / tail diagnostic (exploratory; sparse-count caveat applies).
         seg = np.array_split(ch.ravel(), 10)
         cnt = np.array([s.sum() for s in seg], dtype=np.float64)
         sizes = np.array([len(s) for s in seg], dtype=np.float64)
@@ -278,7 +501,7 @@ def find_cover(stego_path, cover_dir):
     return None
 
 
-def analyze(stego_path, cover_dir, spam_dir, seed=0):
+def analyze(stego_path, cover_dir, spam_dir, syndrome_dir=None, payload_calibration=None, n_perm=DEFAULT_PERMUTATIONS, block_sizes=DEFAULT_BLOCK_SIZES, seed=0):
     rng = np.random.default_rng(seed)
     x = load_gray(stego_path)
     row = {"image": os.path.basename(stego_path), "height": x.shape[0], "width": x.shape[1]}
@@ -289,12 +512,25 @@ def analyze(stego_path, cover_dir, spam_dir, seed=0):
     row.update(lsb_tests(x))
     row.update(blind_selection_channel(x))
 
+    # Syndrome distribution is only valid when the actual STC syndrome is exported.
+    syndrome_path = find_syndrome_file(stego_path, syndrome_dir)
+    if syndrome_path:
+        try:
+            row.update(syndrome_distribution_analysis(np.load(syndrome_path, allow_pickle=False)))
+            row["syndrome_file"] = os.path.basename(syndrome_path)
+        except Exception as exc:
+            row.update({"syndrome_available": False, "syndrome_error": str(exc)})
+    else:
+        row["syndrome_available"] = False
+        row["syndrome_note"] = "No STC syndrome sidecar supplied; cannot infer syndrome from PNG."
+
     cp = find_cover(stego_path, cover_dir)
     row["cover_found"] = cp is not None
     if cp is not None:
         cover = load_gray(cp)
         if cover.shape == x.shape:
-            row.update(known_cover_attacks(cover, x, rng))
+            row.update(known_cover_attacks(cover, x, rng, n_perm=n_perm, block_sizes=block_sizes))
+            row.update(estimate_payload_length(row.get("n_changes", 0), payload_calibration))
         else:
             row["cover_found"] = False
 
@@ -306,9 +542,11 @@ def analyze(stego_path, cover_dir, spam_dir, seed=0):
     row["flag_rs"] = bool(np.isfinite(row["rs_p"]) and row["rs_p"] > RS_P_FLAG)
     row["flag_ws"] = bool(row["ws_p"] > WS_P_FLAG)
     if "fft2d_peak_excess" in row:
-        row["flag_periodicity"] = bool(max(row["fft2d_peak_excess"], row["fft1d_raster_peak_excess"]) > PEAK_RATIO_FLAG)
+        row["flag_periodicity"] = bool(min(row.get("fft2d_p", 1.0), row.get("fft1d_p", 1.0)) < 0.005)
         row["flag_nonuniform_density"] = bool(row["segment_uniformity_p"] < SEG_P_FLAG)
         row["flag_selection_channel"] = bool(row["auc_cost_stego"] > AUC_FLAG)
+        block_ps = [v for k, v in row.items() if k.endswith("_max_p") or k.endswith("_variance_p")]
+        row["flag_block_structure"] = bool(block_ps and min(block_ps) < (BLOCK_P_FLAG / len(block_ps)))
     return row
 
 
@@ -342,38 +580,68 @@ def write_report(rows, summary, params, path):
         L.append(" | ".join(fmt(r.get(c, "")) for c in cols_blind))
     L.append("")
     cols_kc = ["image", "change_rate", "psnr_db", "n_plus1", "n_minus1", "sign_balance_p",
-               "fft2d_peak_excess", "fft1d_raster_peak_excess", "segment_uniformity_p",
-               "tail_rate_over_mean", "auc_cost_cover", "auc_cost_stego"]
-    L.append("B. KNOWN-COVER ATTACKS")
+               "fft2d_peak_excess", "fft2d_p", "fft1d_raster_peak_excess", "fft1d_p",
+               "segment_uniformity_p", "tail_rate_over_mean", "auc_cost_cover", "auc_cost_stego"]
+    L.append("B. KNOWN-COVER / EMBEDDING-PATTERN ANALYSIS")
     L.append(" | ".join(cols_kc))
     for r in rows:
         if r.get("cover_found"):
             L.append(" | ".join(fmt(r.get(c, "")) for c in cols_kc))
     L.append("")
-    L.append("C. DETECTOR FLAGS (True = attack succeeds)")
+    L.append("C. BLOCK-STRUCTURE DIAGNOSTICS")
+    block_cols = sorted({k for r in rows for k in r if k.startswith("block_")})
+    if block_cols:
+        L.append("image | " + " | ".join(block_cols))
+        for r in rows:
+            if r.get("cover_found"):
+                L.append(r["image"] + " | " + " | ".join(fmt(r.get(k, "")) for k in block_cols))
+    else:
+        L.append("No known-cover block diagnostics available.")
+    L.append("")
+    L.append("D. SYNDROME DISTRIBUTION")
+    for r in rows:
+        if r.get("syndrome_available"):
+            L.append(f"{r['image']}: length={r.get('syndrome_length_bits')}, "
+                     f"entropy={fmt(r.get('syndrome_binary_entropy'))}, "
+                     f"monobit_p={fmt(r.get('syndrome_monobit_p'))}, "
+                     f"runs_p={fmt(r.get('syndrome_runs_p'))}, "
+                     f"lag1={fmt(r.get('syndrome_lag1_corr'))}")
+        else:
+            L.append(f"{r['image']}: NOT RUN ({r.get('syndrome_note', r.get('syndrome_error', 'no sidecar'))})")
+    L.append("")
+    L.append("E. PAYLOAD-LENGTH ESTIMATION")
+    for r in rows:
+        if r.get("cover_found"):
+            if r.get("payload_estimation_available"):
+                L.append(f"{r['image']}: estimated_bits={fmt(r.get('payload_estimated_bits'))}, "
+                         f"calibration_R2={fmt(r.get('payload_calibration_r2_training'))}, "
+                         f"calibration_samples={r.get('payload_calibration_samples')}")
+            else:
+                L.append(f"{r['image']}: NOT RUN (independent calibration CSV not supplied)")
+    L.append("")
+    L.append("F. DETECTOR FLAGS (heuristic flags; not proof of successful detection)")
     fl = [c for c in rows[0] if c.startswith("flag_")]
     L.append(" | ".join(["image"] + fl))
     for r in rows:
         L.append(" | ".join([r["image"]] + [fmt(r.get(c, "n/a")) for c in fl]))
     L.append("")
-    L.append("D. SUMMARY ACROSS IMAGES")
+    L.append("G. SUMMARY ACROSS IMAGES")
     for k, v in summary.items():
         L.append(f"  {k}: {fmt(v)}")
     if params:
         L.append("")
-        L.append("E. PARAMETER FILE LEAKAGE")
+        L.append("H. PARAMETER FILE LEAKAGE")
         L.append(f"  plaintext params file exposes: {params}")
     L.append("")
     L.append("INTERPRETATION NOTES")
-    L.append("  chi2_p_embed : ~1 => PoV equalisation (LSB-replacement style). Weak vs +-1 matching.")
-    L.append("  rs_p / ws_p  : estimated relative payload (fraction of pixels). Designed for LSB replacement;")
-    L.append("                 biased for +-1 embedding, so treat as indicative.")
-    L.append("  hcf_ratio    : calibrated HCF-COM; <1 hints embedding.")
-    L.append("  fft*_excess  : observed FFT peak/median divided by a random-permutation null; ~1 => no periodicity.")
-    L.append("  segment_uniformity_p : chi-square of change counts over 10 raster segments (tail/last-block check).")
-    L.append("  auc_cost_*   : AUC of 'low HILL cost => changed'. 0.5 = unpredictable; >0.5 = selection channel leaks.")
-    L.append("  sign_balance_p : binomial test of +1/-1 flip balance; small => biased signs.")
-    open(path, "w", encoding="utf-8").write("\n".join(L) + "\n")
+    L.append("  FFT p-values use exact-count uniformly randomized change maps; this is NOT HILL-cost-conditioned.")
+    L.append("  Block tests compare occupancy with uniform exact-count random maps; not proof of STC block leakage.")
+    L.append("  Selection-channel AUC measures association between low HILL cost and changed locations.")
+    L.append("  Syndrome tests require the actual STC syndrome bits exported by the encoder/decoder.")
+    L.append("  Payload estimates require independent, representative calibration runs; report calibration error on held-out data.")
+    L.append("  RS/WS are primarily LSB-oriented and are only indicative for +/-1 embedding.")
+    L.append("  Sparse changes make ordinary segment chi-square approximations potentially unreliable.")
+    open(path, "w", encoding="utf-8").write("\\n".join(L) + "\\n")
 
 
 def main():
@@ -383,7 +651,26 @@ def main():
     ap.add_argument("--out", default="results")
     ap.add_argument("--params", default="data.txt")
     ap.add_argument("--spam", action="store_true", help="also dump SPAM-686 features")
+    ap.add_argument("--syndrome-dir", default=None,
+                    help="optional folder of actual STC syndrome .npy files, named after stego image")
+    ap.add_argument("--payload-calibration", default=None,
+                    help="CSV with independent calibration columns n_changes,payload_bits")
+    ap.add_argument("--permutations", type=int, default=DEFAULT_PERMUTATIONS,
+                    help="number of exact-count random maps for FFT and block tests")
+    ap.add_argument("--block-sizes", default="8,16,32,64",
+                    help="comma-separated block sizes in pixels")
     args = ap.parse_args()
+
+    if args.permutations < 20:
+        raise SystemExit("--permutations should be at least 20; 200+ is recommended.")
+    try:
+        block_sizes = tuple(sorted({int(v) for v in args.block_sizes.split(",") if v.strip()}))
+    except ValueError:
+        raise SystemExit("--block-sizes must be comma-separated positive integers.")
+    if not block_sizes or any(v <= 0 for v in block_sizes):
+        raise SystemExit("--block-sizes must contain positive integers.")
+
+    calibration = load_payload_calibration(args.payload_calibration) if args.payload_calibration else None
 
     os.makedirs(args.out, exist_ok=True)
     files = sorted(glob.glob(os.path.join(args.stego, "*.png")))
@@ -392,9 +679,16 @@ def main():
 
     spam_dir = os.path.join(args.out, "spam686") if args.spam else None
     rows = []
-    for f in files:
+    for i, f in enumerate(files):
         print(f"analysing {f}")
-        rows.append(analyze(f, args.cover, spam_dir))
+        rows.append(analyze(
+            f, args.cover, spam_dir,
+            syndrome_dir=args.syndrome_dir,
+            payload_calibration=calibration,
+            n_perm=args.permutations,
+            block_sizes=block_sizes,
+            seed=42 + i
+        ))
 
     kc = [r for r in rows if r.get("cover_found")]
     summary = {}
@@ -427,8 +721,12 @@ def main():
             return bool(o)
         raise TypeError(type(o))
 
-    json.dump({"per_image": rows, "summary": summary, "params_file": params},
-              open(os.path.join(args.out, "attack_results.json"), "w"), indent=2, default=conv)
+    with open(os.path.join(args.out, "attack_results.json"), "w", encoding="utf-8") as fh:
+        json.dump({"per_image": rows, "summary": summary, "params_file": params,
+                   "configuration": {"permutations": args.permutations, "block_sizes": block_sizes,
+                                     "syndrome_dir": args.syndrome_dir,
+                                     "payload_calibration": args.payload_calibration}},
+                  fh, indent=2, default=conv)
     write_report(rows, summary, params, os.path.join(args.out, "attack_report.txt"))
     print(f"results written to {args.out}/")
 
