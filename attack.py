@@ -648,7 +648,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stego", default="Stego")
     ap.add_argument("--cover", default="images", help="folder with original covers (known-cover attacks); '' to skip")
-    ap.add_argument("--out", default="results")
+    ap.add_argument("--out", default="steganalysis_res")
     ap.add_argument("--params", default="data.txt")
     ap.add_argument("--spam", action="store_true", help="also dump SPAM-686 features")
     ap.add_argument("--syndrome-dir", default=None,

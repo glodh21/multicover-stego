@@ -22,3 +22,9 @@ venv311/
 sdist/ 
 .venv311
 .venv311/
+
+*.csv
+*.json
+
+/results/spam686
+/steganalysis_res/spam686
