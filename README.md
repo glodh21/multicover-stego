@@ -8,3 +8,5 @@ Output Format
 
 python3 main.py
 
+to run attack.py
+python attack.py --stego Stego --cover images --out results --params data.txt --spam
