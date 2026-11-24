@@ -142,12 +142,13 @@ def main():
         "images/mid_house.png",
         "images/mid_door.png",
         "images/high_kayak.png",
+        
     ]
 
-    secret_text = (
+    '''secret_text = (
         "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
-    )
-    # secret_text = open("secret.txt", encoding="utf-8").read()
+    )'''
+    secret_text = open("secret.txt", encoding="utf-8").read()
 
     calculator = HillCapacityCalculator(target_bpp=0.4, floor_fraction=0.0)
     capacities = calculator.calculate_image_capacities(my_images)
