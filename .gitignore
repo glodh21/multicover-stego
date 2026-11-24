@@ -17,3 +17,8 @@ data.txt
 key_envelope.json
 # RSA keys — keep both local
 keys/
+
+venv311/
+sdist/ 
+.venv311
+.venv311/
