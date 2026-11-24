@@ -25,6 +25,9 @@ sdist/
 
 *.csv
 *.json
+*.pdf
+*.pptx
+*.docx
 
 /results/spam686
 /steganalysis_res/spam686

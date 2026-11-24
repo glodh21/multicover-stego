@@ -1,0 +1,8 @@
+numpy
+Pillow
+scipy
+pystcstego
+cryptography
+scikit-image
+pandas
+matplotlib
