@@ -1,200 +1,174 @@
 #!/usr/bin/env python3
 """
-Analyse results/runs.csv and results/images.csv produced by benchmark.py.
+Simple graphs from results/runs.csv (made by benchmark.py).
 
-    python analyze.py                 # reads ./results, writes ./results/plots
-    python analyze.py --dir results --show
+    python analyze.py                  # reads ./results, writes ./results/plots
 
-Outputs
--------
-    results/summary_by_config.csv   mean/std/min/max per (text_bytes, n_images)
-    results/stage_breakdown.csv     mean stage times per (text_bytes, n_images)
-    results/plots/*.png
-Timing plots use only runs where status == ok AND every chunk fit its image
-(otherwise embedding was skipped and the timing is not comparable).
+Three graphs:
+  1_time_vs_images.png   one small panel per text size, own y-scale each
+  2_time_vs_text.png     one small panel per image count, own y-scale each
+  3_where_time_goes.png  which pipeline stage takes the time
+
+Every panel has its own y-axis, zoomed to its own data, so differences are
+visible even when text sizes or image counts differ a lot in absolute time.
+The Poppins font is loaded from the 'fonts' folder next to this script.
 """
 import argparse
+import glob
 import os
 
-import matplotlib
+import matplotlib as mpl
 import numpy as np
 import pandas as pd
 
-STAGES = ["t_capacity_s", "t_keygen_wrap_s", "t_header_s",
-          "t_split_encrypt_s", "t_embed_s"]
-STAGE_LABELS = {"t_capacity_s": "HILL capacity", "t_keygen_wrap_s": "AES key + RSA wrap",
-                "t_header_s": "header sizes", "t_split_encrypt_s": "split + AES-GCM",
-                "t_embed_s": "STC embed"}
+mpl.use("Agg")
+import matplotlib.pyplot as plt                      # noqa: E402
+from matplotlib import font_manager                  # noqa: E402
+from matplotlib.ticker import MaxNLocator            # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+BG, INK, MUTED, GRID = "#FFFFFF", "#222222", "#777777", "#E8E8E8"
+BLUE, ORANGE = "#3B6FE0", "#F28C28"
+
+STAGES = {"t_capacity_s": "HILL capacity", "t_embed_s": "STC embedding",
+          "t_split_encrypt_s": "Split + AES-GCM", "t_keygen_wrap_s": "AES key + RSA wrap",
+          "t_header_s": "Header sizes"}
 
 
-def load(d):
-    runs = pd.read_csv(os.path.join(d, "runs.csv"))
-    imgs = pd.read_csv(os.path.join(d, "images.csv"))
-    runs["all_fit"] = runs["all_fit"].astype(str).str.lower().eq("true")
-    return runs, imgs
+def setup_style():
+    for f in glob.glob(os.path.join(HERE, "fonts", "*.ttf")):
+        font_manager.fontManager.addfont(f)
+    names = {f.name for f in font_manager.fontManager.ttflist}
+    family = next((f for f in ["Poppins", "Inter", "Segoe UI", "Helvetica Neue",
+                               "Arial", "DejaVu Sans"] if f in names), "DejaVu Sans")
+    mpl.rcParams.update({
+        "font.family": family, "text.color": INK,
+        "figure.facecolor": BG, "axes.facecolor": BG, "savefig.facecolor": BG,
+        "axes.edgecolor": GRID, "axes.spines.top": False, "axes.spines.right": False,
+        "axes.grid": True, "axes.grid.axis": "y", "grid.color": GRID, "grid.linewidth": 1,
+        "axes.axisbelow": True,
+        "axes.titlesize": 13, "axes.titleweight": "medium", "axes.titlepad": 10,
+        "axes.labelcolor": INK, "axes.labelsize": 11,
+        "xtick.color": MUTED, "ytick.color": MUTED,
+        "xtick.labelsize": 10, "ytick.labelsize": 10,
+        "xtick.major.size": 0, "ytick.major.size": 0,
+    })
 
 
-def save(fig, d, name, show):
-    path = os.path.join(d, "plots", name)
+def fmt_bytes(n):
+    n = float(n)
+    if n < 1000:
+        return f"{n:g} B"
+    return f"{n / 1000:g} KB" if n < 1e6 else f"{n / 1e6:g} MB"
+
+
+def fmt_time(s):
+    return f"{s * 1000:.1f} ms" if s < 0.1 else f"{s:.2f} s"
+
+
+def zoom_y(ax, lo, hi):
+    """Fit y-range to the data so small differences are visible."""
+    span = hi - lo
+    pad = span * 0.2 if span > 0 else max(hi * 0.1, 0.01)
+    ax.set_ylim(max(0, lo - pad), hi + pad)
+
+
+def panels(n, ncols):
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 3.5 * nrows),
+                             squeeze=False)
+    flat = axes.ravel()
+    for ax in flat[n:]:
+        ax.set_visible(False)
+    return fig, flat
+
+
+def finish(fig, title, subtitle, xlabel, ylabel, path):
+    fig.suptitle(title, x=0.01, ha="left", fontsize=17, fontweight="bold", y=1.10)
+    fig.text(0.01, 1.045, subtitle, ha="left", va="top", fontsize=10.5, color=MUTED)
+    fig.supxlabel(xlabel, fontsize=11)
+    fig.supylabel(ylabel, fontsize=11)
     fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    if not show:
-        import matplotlib.pyplot as plt
-        plt.close(fig)
-    print("  wrote", path)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print("wrote", path)
+
+
+def draw_line(ax, x, mean, std, color):
+    std = np.nan_to_num(std)
+    ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.18, linewidth=0)
+    ax.plot(x, mean, color=color, lw=2.4, marker="o", ms=7,
+            markeredgecolor="white", markeredgewidth=1.5)
+    zoom_y(ax, (mean - std).min(), (mean + std).max())
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default="results")
-    ap.add_argument("--show", action="store_true")
     args = ap.parse_args()
-    if not args.show:
-        matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
-    d = args.dir
-    os.makedirs(os.path.join(d, "plots"), exist_ok=True)
-    runs, imgs = load(d)
+    setup_style()
+    out = os.path.join(args.dir, "plots")
+    os.makedirs(out, exist_ok=True)
 
-    ok = runs[(runs.status == "ok") & runs.all_fit].copy()
-    print(f"{len(runs)} runs total, {len(ok)} usable for timing "
-          f"({len(runs) - len(ok)} errored or did not fit).")
+    runs = pd.read_csv(os.path.join(args.dir, "runs.csv"))
+    ok = runs[runs.status == "ok"]
     if ok.empty:
-        print("Nothing to plot: no run had every chunk fit. Try smaller text or more images.")
-        return
-
-    # ---------- tables ----------
+        raise SystemExit("No successful runs in runs.csv")
     agg = (ok.groupby(["text_bytes", "n_images"])["t_total_s"]
-             .agg(["count", "mean", "std", "min", "max"]).reset_index())
-    agg.to_csv(os.path.join(d, "summary_by_config.csv"), index=False)
-    stage = ok.groupby(["text_bytes", "n_images"])[STAGES + ["t_total_s"]].mean().reset_index()
-    stage.to_csv(os.path.join(d, "stage_breakdown.csv"), index=False)
-    print(agg.to_string(index=False))
+             .agg(["mean", "std"]).reset_index())
+    sizes = sorted(agg.text_bytes.unique())
+    counts = sorted(agg.n_images.unique())
 
-    sizes = sorted(ok.text_bytes.unique())
-    counts = sorted(ok.n_images.unique())
+    # 1) time vs number of images: one panel per text size
+    fig, axes = panels(len(sizes), min(3, len(sizes)))
+    for ax, s in zip(axes, sizes):
+        g = agg[agg.text_bytes == s].sort_values("n_images")
+        draw_line(ax, g.n_images.values, g["mean"].values, g["std"].values, BLUE)
+        ax.set_title(fmt_bytes(s))
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    finish(fig, "Runtime vs number of images",
+           "Each panel is one text size and has its own y-scale. Shaded band = ±1 std.",
+           "number of images", "total time (s)",
+           os.path.join(out, "1_time_vs_images.png"))
 
-    # 1) total time vs number of images, one line per text size
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for s in sizes:
-        g = agg[agg.text_bytes == s]
-        ax.errorbar(g.n_images, g["mean"], yerr=g["std"].fillna(0), marker="o",
-                    capsize=3, label=f"{s:,} B")
-    ax.set_xlabel("number of images"); ax.set_ylabel("total time (s)")
-    ax.set_title("Total runtime vs number of images")
-    ax.legend(title="text size"); ax.grid(alpha=.3)
-    save(fig, d, "01_time_vs_images.png", args.show)
+    # 2) time vs text size: one panel per image count (categorical x, even spacing)
+    fig, axes = panels(len(counts), min(4, len(counts)))
+    for ax, n in zip(axes, counts):
+        g = agg[agg.n_images == n].sort_values("text_bytes")
+        pos = [sizes.index(v) for v in g.text_bytes]
+        draw_line(ax, np.array(pos), g["mean"].values, g["std"].values, ORANGE)
+        ax.set_xticks(range(len(sizes)))
+        ax.set_xticklabels([fmt_bytes(v) for v in sizes], fontsize=8.5)
+        ax.set_xlim(-0.4, len(sizes) - 0.6)
+        ax.set_title(f"{n} image{'s' if n > 1 else ''}")
+    finish(fig, "Runtime vs text size",
+           "Each panel is one image count and has its own y-scale. Shaded band = ±1 std.",
+           "text size", "total time (s)",
+           os.path.join(out, "2_time_vs_text.png"))
 
-    # 2) total time vs text size, one line per image count
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for n in counts:
-        g = agg[agg.n_images == n]
-        ax.errorbar(g.text_bytes, g["mean"], yerr=g["std"].fillna(0), marker="o",
-                    capsize=3, label=f"{n} img")
-    ax.set_xscale("log"); ax.set_xlabel("text size (bytes, log)")
-    ax.set_ylabel("total time (s)"); ax.set_title("Total runtime vs text size")
-    ax.legend(ncol=2); ax.grid(alpha=.3, which="both")
-    save(fig, d, "02_time_vs_text_size.png", args.show)
-
-    # 3) stage breakdown vs number of images (averaged over text sizes)
-    by_n = ok.groupby("n_images")[STAGES].mean().reindex(counts)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bottom = np.zeros(len(by_n))
-    for st in STAGES:
-        ax.bar(by_n.index.astype(str), by_n[st], bottom=bottom, label=STAGE_LABELS[st])
-        bottom += by_n[st].values
-    ax.set_xlabel("number of images"); ax.set_ylabel("mean time (s)")
-    ax.set_title("Where the time goes (avg over text sizes)")
-    ax.legend(); save(fig, d, "03_stage_breakdown_by_images.png", args.show)
-
-    # 4) stage breakdown vs text size (averaged over image counts)
-    by_s = ok.groupby("text_bytes")[STAGES].mean().reindex(sizes)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bottom = np.zeros(len(by_s))
-    for st in STAGES:
-        ax.bar([f"{s:,}" for s in by_s.index], by_s[st], bottom=bottom,
-               label=STAGE_LABELS[st])
-        bottom += by_s[st].values
-    ax.set_xlabel("text size (bytes)"); ax.set_ylabel("mean time (s)")
-    ax.set_title("Where the time goes (avg over image counts)")
-    ax.legend(); save(fig, d, "04_stage_breakdown_by_size.png", args.show)
-
-    # 5) heatmap of mean total time
-    piv = agg.pivot(index="text_bytes", columns="n_images", values="mean")
-    fig, ax = plt.subplots(figsize=(8, 5))
-    im = ax.imshow(piv.values, aspect="auto", origin="lower", cmap="viridis")
-    ax.set_xticks(range(len(piv.columns))); ax.set_xticklabels(piv.columns)
-    ax.set_yticks(range(len(piv.index))); ax.set_yticklabels([f"{s:,}" for s in piv.index])
-    ax.set_xlabel("number of images"); ax.set_ylabel("text size (bytes)")
-    ax.set_title("Mean total time (s)"); fig.colorbar(im)
-    save(fig, d, "05_heatmap_time.png", args.show)
-
-    # 6) feasibility heatmap: fraction of runs where all chunks fit
-    feas = (runs.groupby(["text_bytes", "n_images"])["all_fit"].mean()
-                .unstack("n_images"))
-    fig, ax = plt.subplots(figsize=(8, 5))
-    im = ax.imshow(feas.values, aspect="auto", origin="lower", cmap="RdYlGn", vmin=0, vmax=1)
-    ax.set_xticks(range(len(feas.columns))); ax.set_xticklabels(feas.columns)
-    ax.set_yticks(range(len(feas.index))); ax.set_yticklabels([f"{s:,}" for s in feas.index])
-    ax.set_xlabel("number of images"); ax.set_ylabel("text size (bytes)")
-    ax.set_title("Fraction of runs where payload fits"); fig.colorbar(im)
-    save(fig, d, "06_feasibility.png", args.show)
-
-    # 7) throughput (text bytes processed per second)
-    ok["throughput_Bps"] = ok.text_bytes / ok.t_total_s
-    tp = ok.groupby(["text_bytes", "n_images"])["throughput_Bps"].mean().reset_index()
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for s in sizes:
-        g = tp[tp.text_bytes == s]
-        ax.plot(g.n_images, g.throughput_Bps, marker="o", label=f"{s:,} B")
-    ax.set_yscale("log"); ax.set_xlabel("number of images")
-    ax.set_ylabel("throughput (bytes/s, log)"); ax.set_title("Throughput")
-    ax.legend(title="text size"); ax.grid(alpha=.3, which="both")
-    save(fig, d, "07_throughput.png", args.show)
-
-    # 8) capacity utilisation vs text size
-    fig, ax = plt.subplots(figsize=(8, 5))
-    u = runs[runs.status == "ok"].groupby(["text_bytes", "n_images"])["utilization"].mean().reset_index()
-    for n in sorted(u.n_images.unique()):
-        g = u[u.n_images == n]
-        ax.plot(g.text_bytes, g.utilization * 100, marker="o", label=f"{n} img")
-    ax.axhline(100, color="red", ls="--", lw=1)
-    ax.set_xscale("log"); ax.set_xlabel("text size (bytes, log)")
-    ax.set_ylabel("payload / total capacity (%)"); ax.set_title("Capacity utilisation")
-    ax.legend(ncol=2); ax.grid(alpha=.3, which="both")
-    save(fig, d, "08_utilization.png", args.show)
-
-    # 9) per-image embed time vs payload size and vs pixels
-    im_ok = imgs[imgs.embedded.astype(str).str.lower().eq("true")]
-    if not im_ok.empty:
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        axes[0].scatter(im_ok.encrypted_len_bits, im_ok.t_embed_s, s=12, alpha=.5)
-        axes[0].set_xlabel("encrypted payload (bits)"); axes[0].set_ylabel("embed time (s)")
-        axes[0].set_title("STC embed time vs payload")
-        for name, g in im_ok.groupby("image"):
-            axes[1].scatter(g.pixels, g.t_embed_s, s=12, alpha=.5, label=name)
-        axes[1].set_xlabel("image pixels"); axes[1].set_title("STC embed time vs image size")
-        axes[1].legend(fontsize=7)
-        for a in axes:
-            a.grid(alpha=.3)
-        save(fig, d, "09_embed_per_image.png", args.show)
-
-    # 10) overhead of header + nonce + tag as a fraction of payload
-    fig, ax = plt.subplots(figsize=(8, 5))
-    o = runs[runs.status == "ok"].groupby(["text_bytes", "n_images"])[["overhead_bits", "text_bits"]].mean().reset_index()
-    o["overhead_pct"] = o.overhead_bits / o.text_bits * 100
-    for n in sorted(o.n_images.unique()):
-        g = o[o.n_images == n]
-        ax.plot(g.text_bytes, g.overhead_pct, marker="o", label=f"{n} img")
-    ax.set_xscale("log"); ax.set_yscale("log")
-    ax.set_xlabel("text size (bytes)"); ax.set_ylabel("overhead (% of text bits)")
-    ax.set_title("Crypto + header overhead (nonce 96b + tag 128b + header per image)")
-    ax.legend(ncol=2); ax.grid(alpha=.3, which="both")
-    save(fig, d, "10_overhead.png", args.show)
-
-    if args.show:
-        plt.show()
+    # 3) which stage takes the time
+    means = ok[list(STAGES)].mean().sort_values()
+    total = means.sum()
+    fig, ax = plt.subplots(figsize=(9, 3.8))
+    bars = ax.barh([STAGES[k] for k in means.index], means.values,
+                   color=BLUE, height=0.6)
+    bars[-1].set_color(ORANGE)
+    for b, v in zip(bars, means.values):
+        ax.text(v + total * 0.01, b.get_y() + b.get_height() / 2,
+                f"{fmt_time(v)}  ({v / total:.0%})", va="center", fontsize=10)
+    ax.set_xlim(0, means.max() * 1.35)
+    ax.grid(axis="y", visible=False); ax.grid(axis="x", visible=True)
+    ax.set_xlabel("mean time per run (s)")
+    ax.set_title("Where the time goes", loc="left", fontsize=17, fontweight="bold", pad=24)
+    ax.text(0, 1.03, "Mean over all logged runs", transform=ax.transAxes,
+            fontsize=10.5, color=MUTED)
+    fig.tight_layout()
+    path = os.path.join(out, "3_where_time_goes.png")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print("wrote", path)
 
 
 if __name__ == "__main__":

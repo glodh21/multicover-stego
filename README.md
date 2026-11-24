@@ -10,3 +10,10 @@ python3 main.py
 
 to run attack.py
 python attack.py --stego Stego --cover images --params data.txt --spam
+
+
+
+python benchmark.py                          # sizes 100B-50KB, 1-10 images, 3 repeats
+python benchmark.py --sizes 100 1000 10000 100000 --counts 1 2 3 5 8 12 15 --repeats 5
+python benchmark.py --text-files secret.txt  # also test a real file
+python analyze.py

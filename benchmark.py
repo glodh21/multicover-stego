@@ -17,6 +17,9 @@ Example
     python benchmark.py --counts $(seq 1 15) --image-dir images
     python benchmark.py --text-files secret_small.txt secret_large.txt
 
+Runs where the text does not fit its images are reported with a warning and are
+NOT written to either CSV (so every logged run is a complete, comparable run).
+
 If fewer distinct images exist than the requested count, the image pool is
 cycled (img0, img1, ..., img0, img1, ...). Timing stays valid; just remember
 that cycled images repeat the same cover content.
@@ -138,6 +141,17 @@ def run_once(text, images, target_bpp, floor_fraction, pubkey, keep_dir=None):
         chunks = pipeline.split_and_encrypt(text, capacities, seq_bits, len_bits, key)
         t["t_split_encrypt_s"] = time.perf_counter() - s
 
+        # If any chunk does not fit its image, abort this run before embedding.
+        # The caller prints a warning and keeps the run out of the logs.
+        misfit = [c for c in chunks if not c["fits"]]
+        if misfit:
+            info["status"] = "no_fit"
+            info["misfit"] = [
+                (os.path.basename(c["path"]), c["encrypted_len_bits"],
+                 c["max_capacity_bits"]) for c in misfit
+            ]
+            return {**t, **info}, []
+
         # 5) embed (timed per image, one call per chunk -> same total work)
         seed = secrets.randbelow(2 ** 31)
         out_dir = keep_dir or os.path.join(tmp, "Stego")
@@ -235,6 +249,7 @@ def main():
 
     total = len(workloads) * len(args.counts) * args.repeats
     done = 0
+    skipped = []  # (text_bytes, n_images) configs that did not fit
     meta = {"python": platform.python_version(),
             "platform": platform.platform(),
             "cpu_count": os.cpu_count()}
@@ -251,6 +266,18 @@ def main():
                             if args.keep_stego else None)
                     res, image_rows = run_once(text, images, args.target_bpp,
                                                args.floor_fraction, args.pubkey, keep)
+
+                    if res["status"] == "no_fit":
+                        details = "; ".join(
+                            f"{name} needs {need:,} bits, capacity {cap:,}"
+                            for name, need, cap in res["misfit"])
+                        print(f"[{done}/{total}] WARNING: {text_bytes:,} B does not fit "
+                              f"in {n} image(s) -> {details}. Not logged.")
+                        skipped.append((text_bytes, n))
+                        # Text and capacities are deterministic, so remaining
+                        # repeats would fail the same way: skip them.
+                        done += args.repeats - rep - 1
+                        break
                     runs_log.write({
                         "run_id": run_id,
                         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -272,6 +299,10 @@ def main():
         runs_log.close()
         imgs_log.close()
     print(f"\nDone. Logs in {args.out}/runs.csv and {args.out}/images.csv")
+    if skipped:
+        print(f"{len(skipped)} configuration(s) did not fit and were not logged:")
+        for tb, n in skipped:
+            print(f"  {tb:,} B in {n} image(s)")
 
 
 if __name__ == "__main__":
