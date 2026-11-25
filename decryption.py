@@ -5,8 +5,9 @@ from PIL import Image
 import pystc
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
+from getpass import getpass
 
-from key_exchange import decrypt_aes_key
+from encryption import recover_receiver_key
 
 NONCE_BYTES = 12
 TAG_BYTES = 16
@@ -29,6 +30,8 @@ def load_params(path: str = DATA_FILE) -> dict:
         "seed": int(raw["SEED"]),
         "seq_bits": int(raw["SEQ_BITS"]),
         "len_bits": int(raw["LEN_BITS"]),
+        "ephemeral_public_key": raw["EPHEMERAL_PUBLIC_KEY"],
+        "hkdf_salt": raw["HKDF_SALT"],
     }
 
 
@@ -62,10 +65,13 @@ def main():
     # 1. Load extraction parameters.
     params = load_params(DATA_FILE)
 
-    # 2. Recover the AES key using the receiver's RSA private key.
-    aes_key = decrypt_aes_key(
+    # 2. Recreate the AES key using the receiver's X25519 private key.
+    password = getpass("Receiver private-key passphrase: ").encode("utf-8")
+    aes_key = recover_receiver_key(
         private_key_path="keys/receiver_private.pem",
-        envelope_path="key_envelope.json",
+        ephemeral_public_key=params["ephemeral_public_key"],
+        hkdf_salt=params["hkdf_salt"],
+        password=password,
     )
     aesgcm = AESGCM(aes_key)
 

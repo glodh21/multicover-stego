@@ -41,10 +41,8 @@ import uuid
 from datetime import datetime
 
 from PIL import Image
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
+from encryption import create_sender_session, split_and_encrypt
 from image_percent import HillCapacityCalculator
-from key_exchange import encrypt_aes_key
 import main as pipeline  # reuses your real functions, so timings reflect the real code
 
 RUN_FIELDS = [
@@ -124,11 +122,9 @@ def run_once(text, images, target_bpp, floor_fraction, pubkey, keep_dir=None):
 
         capacities.sort(key=lambda c: c["max_capacity_bits"])
 
-        # 2) AES key + RSA envelope
+        # 2) X25519 key agreement + HKDF
         s = time.perf_counter()
-        key = AESGCM.generate_key(bit_length=256)
-        encrypt_aes_key(key, public_key_path=pubkey,
-                        envelope_path=os.path.join(tmp, "key_envelope.json"))
+        key, _ = create_sender_session(pubkey)
         t["t_keygen_wrap_s"] = time.perf_counter() - s
 
         # 3) header widths
@@ -138,7 +134,7 @@ def run_once(text, images, target_bpp, floor_fraction, pubkey, keep_dir=None):
 
         # 4) split + encrypt
         s = time.perf_counter()
-        chunks = pipeline.split_and_encrypt(text, capacities, seq_bits, len_bits, key)
+        chunks = split_and_encrypt(text, capacities, seq_bits, len_bits, key)
         t["t_split_encrypt_s"] = time.perf_counter() - s
 
         # If any chunk does not fit its image, abort this run before embedding.

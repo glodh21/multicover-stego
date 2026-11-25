@@ -32,7 +32,7 @@ BG, INK, MUTED, GRID = "#FFFFFF", "#222222", "#777777", "#E8E8E8"
 BLUE, ORANGE = "#3B6FE0", "#F28C28"
 
 STAGES = {"t_capacity_s": "HILL capacity", "t_embed_s": "STC embedding",
-          "t_split_encrypt_s": "Split + AES-GCM", "t_keygen_wrap_s": "AES key + RSA wrap",
+          "t_split_encrypt_s": "Split + AES-GCM", "t_keygen_wrap_s": "Key establishment",
           "t_header_s": "Header sizes"}
 
 

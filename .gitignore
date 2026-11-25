@@ -7,15 +7,14 @@ venv/
 __pycache__/
 *.py[cod]
 
-# Private keys and encryption secrets
+# Receiver private keys and encryption secrets
 keys/receiver_private.pem
 .env
 
 # Generated files
 Stego/
 data.txt
-key_envelope.json
-# RSA keys — keep both local
+# Receiver key pair — keep local
 keys/
 
 venv311/
